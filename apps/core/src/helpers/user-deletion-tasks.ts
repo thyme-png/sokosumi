@@ -1,5 +1,8 @@
 import * as Sentry from "@sentry/node";
-import { TaskPaymentClaimStatus } from "@sokosumi/database";
+import {
+  TaskPaymentClaimStatus,
+  TaskX402PaymentStatus,
+} from "@sokosumi/database";
 import type { createPrismaClient } from "@sokosumi/database/client";
 import { APIError } from "better-auth/api";
 
@@ -18,6 +21,10 @@ type PrismaClient = ReturnType<typeof createPrismaClient>;
  * - Pending task-payment claims block deletion because their debit must remain
  *   available for purchase recovery or compensation. Terminal claims are
  *   removed so their RESTRICT transaction relations do not block user cascade.
+ * - Pending x402 payments block deletion the same way (the reconciler clears
+ *   them within a bounded window, so no operator page). Terminal x402 payments
+ *   are removed because their RESTRICT task and transaction relations would
+ *   otherwise block both the owned-task delete and the user cascade.
  * - Public blob files for owned tasks are best-effort deleted after the DB
  *   cascade (URLs remain public if blob GC fails).
  */
@@ -88,6 +95,47 @@ export async function prepareTasksForUserDeletion(
           ],
         },
         OR: [{ transaction: { userId } }, { refundTransaction: { userId } }],
+      },
+    });
+
+    // A PENDING x402 payment either re-runs its sign on coworker retry or is
+    // auto-refunded by the reconciler — bounded, self-clearing, so unlike a
+    // review-required claim it never pages Sentry. The task-owner branch
+    // matters because taskId is RESTRICT: a pending payment on an owned task
+    // blocks the owned-task delete below regardless of who was charged.
+    const pendingX402Payment = await tx.taskX402Payment.findFirst({
+      where: {
+        status: TaskX402PaymentStatus.PENDING,
+        OR: [{ transaction: { userId } }, { task: { ownerId: userId } }],
+      },
+      select: { id: true },
+    });
+    if (pendingX402Payment) {
+      throw new APIError("BAD_REQUEST", {
+        code: "TASK_X402_PAYMENT_PENDING",
+        message:
+          "Wait for pending task payments to settle before deleting your account.",
+      });
+    }
+
+    // Terminal x402 payments hold RESTRICT relations on the task, the charge
+    // transaction, and any refund transaction; every branch must be swept or
+    // the owned-task delete / user cascade fails. Operator attribution
+    // survives in the FK-free task_x402_payment_action rows.
+    await tx.taskX402Payment.deleteMany({
+      where: {
+        status: {
+          in: [
+            TaskX402PaymentStatus.VERIFIED,
+            TaskX402PaymentStatus.FAILED,
+            TaskX402PaymentStatus.REFUNDED,
+          ],
+        },
+        OR: [
+          { transaction: { userId } },
+          { refundTransaction: { userId } },
+          { task: { ownerId: userId } },
+        ],
       },
     });
 
